@@ -1,7 +1,10 @@
 import os
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
-from dotenv import load_dotenv
+
+import redis
 import requests
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 
 load_dotenv()
@@ -12,6 +15,17 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:10.0) Gecko/20100101 Firefox/10.0",
     "Content-Type": "application/x-www-form-urlencoded",
 }
+
+REDIS_KEY_PREFIX = "lucky_number:"
+CACHE_HOUR = 6
+
+
+def seconds_until_6am() -> int:
+    now = datetime.now()
+    target = now.replace(hour=CACHE_HOUR, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    return int((target - now).total_seconds())
 
 
 def login(login: str, password: str) -> requests.Session:
@@ -29,17 +43,75 @@ def login(login: str, password: str) -> requests.Session:
     return s
 
 
+def fetch_lucky_number(session: requests.Session) -> int:
+    resp = session.get(LUCKY_NUMBER_URL)
+    data = resp.json()
+    return data["LuckyNumber"]["LuckyNumber"]
+
+
+def today_key() -> str:
+    return f"{REDIS_KEY_PREFIX}{datetime.now().strftime('%Y-%m-%d')}"
+
+
+def get_cached_number(r: redis.Redis) -> int | None:
+    val = r.get(today_key())
+    return int(val) if val is not None else None
+
+
+def set_cached_number(r: redis.Redis, number: int) -> None:
+    ttl = seconds_until_6am()
+    r.set(today_key(), number, ex=ttl)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.session = login(os.getenv("LOGIN"), os.getenv("PASSWORD"))
+    app.state.redis = redis.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", 6379)),
+        db=int(os.getenv("REDIS_DB", 0)),
+        decode_responses=True,
+    )
+    try:
+        app.state.redis.ping()
+    except redis.ConnectionError:
+        raise RuntimeError("Cannot connect to Redis")
     yield
+    app.state.redis.close()
+
 
 app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/lucky-number")
 def lucky_number(request: Request):
+    r: redis.Redis = request.app.state.redis
     s: requests.Session = request.app.state.session
-    resp = s.get(LUCKY_NUMBER_URL)
-    data = resp.json()
-    return {"lucky_number": data["LuckyNumber"]["LuckyNumber"]}
+
+    cached = get_cached_number(r)
+    if cached is not None:
+        return {"lucky_number": cached, "source": "cache"}
+
+    number = fetch_lucky_number(s)
+    set_cached_number(r, number)
+    return {"lucky_number": number, "source": "api"}
+
+
+@app.get("/lucky-number/refresh")
+def lucky_number_refresh(request: Request):
+    r: redis.Redis = request.app.state.redis
+    s: requests.Session = request.app.state.session
+
+    number = fetch_lucky_number(s)
+    set_cached_number(r, number)
+    return {"lucky_number": number, "source": "refresh"}
+
+
+@app.get("/health")
+def health(request: Request):
+    r: redis.Redis = request.app.state.redis
+    try:
+        r.ping()
+        return {"status": "ok", "redis": "connected"}
+    except redis.ConnectionError:
+        return {"status": "error", "redis": "disconnected"}
