@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 import redis
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException, Depends
 
 load_dotenv()
 
@@ -18,6 +18,15 @@ HEADERS = {
 
 REDIS_KEY_PREFIX = "lucky_number:"
 CACHE_HOUR = 6
+
+REFRESH_KEY = os.getenv("REFRESH_KEY")
+
+
+def verify_refresh_key(key: str | None = None) -> None:
+    if not REFRESH_KEY:
+        raise HTTPException(status_code=500, detail="REFRESH_KEY is not configured on the server")
+    if key != REFRESH_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing refresh key")
 
 
 def seconds_until_6am() -> int:
@@ -98,9 +107,10 @@ def lucky_number(request: Request):
 
 
 @app.get("/lucky-number/refresh")
-def lucky_number_refresh(request: Request):
-    r: redis.Redis = request.app.state.redis
+def lucky_number_refresh(request: Request, _: None = Depends(verify_refresh_key)):
+    request.app.state.session = login(os.getenv("LOGIN"), os.getenv("PASSWORD"))
     s: requests.Session = request.app.state.session
+    r: redis.Redis = request.app.state.redis
 
     number = fetch_lucky_number(s)
     set_cached_number(r, number)
