@@ -38,24 +38,54 @@ def seconds_until_6am() -> int:
 
 
 def login(login: str, password: str) -> requests.Session:
+    print(f"[login] START - logowanie jako {login!r}")
     s = requests.Session()
     s.headers.update(HEADERS)
     s.headers["Referer"] = "https://portal.librus.pl/"
 
     r = s.get(f"{SYNERGIA_URL}/loguj/portalRodzina", allow_redirects=True)
+    print(f"[login] Krok 1 (GET portalRodzina) - status={r.status_code}, url_koncowy={r.url}")
+
     r = s.post(
         r.url,
         data={"action": "login", "login": login, "pass": password},
     )
-    r = s.get(f"https://api.librus.pl{r.json()['goTo']}", allow_redirects=True)
+    print(f"[login] Krok 2 (POST login) - status={r.status_code}, body={r.text[:300]!r}")
+
+    try:
+        go_to = r.json()["goTo"]
+    except (KeyError, ValueError) as e:
+        print(f"[login] BŁĄD - brak 'goTo' w odpowiedzi po zalogowaniu: {e} | body={r.text[:500]!r}")
+        raise
+
+    r = s.get(f"https://api.librus.pl{go_to}", allow_redirects=True)
+    print(f"[login] Krok 3 (GET {go_to}) - status={r.status_code}")
+    print(f"[login] SUKCES - sesja utworzona, cookies={list(s.cookies.keys())}")
 
     return s
 
 
 def fetch_lucky_number(session: requests.Session) -> int:
+    print(f"[fetch_lucky_number] START - GET {LUCKY_NUMBER_URL}")
     resp = session.get(LUCKY_NUMBER_URL)
-    data = resp.json()
-    return data["LuckyNumber"]["LuckyNumber"]
+    print(f"[fetch_lucky_number] Status odpowiedzi: {resp.status_code}")
+
+    try:
+        data = resp.json()
+    except ValueError as e:
+        print(f"[fetch_lucky_number] BŁĄD parsowania JSON: {e} | raw body: {resp.text[:500]!r}")
+        raise
+
+    print(f"[fetch_lucky_number] Odebrane dane: {data}")
+
+    try:
+        number = data["LuckyNumber"]["LuckyNumber"]
+    except (KeyError, TypeError) as e:
+        print(f"[fetch_lucky_number] BŁĄD wyciągania klucza LuckyNumber: {e} | pełne data: {data}")
+        raise
+
+    print(f"[fetch_lucky_number] SUKCES - lucky_number={number}")
+    return number
 
 
 def today_key() -> str:
@@ -94,26 +124,44 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/lucky-number")
 def lucky_number(request: Request):
+    print("[GET /lucky-number] Request przyjęty")
     r: redis.Redis = request.app.state.redis
     s: requests.Session = request.app.state.session
 
     cached = get_cached_number(r)
     if cached is not None:
+        print(f"[GET /lucky-number] Trafienie w cache: {cached}")
         return {"lucky_number": cached, "source": "cache"}
 
-    number = fetch_lucky_number(s)
+    print("[GET /lucky-number] Brak w cache - pobieram z API Librusa")
+    try:
+        number = fetch_lucky_number(s)
+    except Exception as e:
+        print(f"[GET /lucky-number] BŁĄD podczas fetch_lucky_number: {type(e).__name__}: {e}")
+        raise
     set_cached_number(r, number)
+    print(f"[GET /lucky-number] SUKCES - number={number}, zapisano do cache")
     return {"lucky_number": number, "source": "api"}
 
 
 @app.get("/lucky-number/refresh")
 def lucky_number_refresh(request: Request, _: None = Depends(verify_refresh_key)):
-    request.app.state.session = login(os.getenv("LOGIN"), os.getenv("PASSWORD"))
+    print("[GET /lucky-number/refresh] Ręczny refresh - loguję się ponownie")
+    try:
+        request.app.state.session = login(os.getenv("LOGIN"), os.getenv("PASSWORD"))
+    except Exception as e:
+        print(f"[GET /lucky-number/refresh] BŁĄD podczas login(): {type(e).__name__}: {e}")
+        raise
     s: requests.Session = request.app.state.session
     r: redis.Redis = request.app.state.redis
 
-    number = fetch_lucky_number(s)
+    try:
+        number = fetch_lucky_number(s)
+    except Exception as e:
+        print(f"[GET /lucky-number/refresh] BŁĄD podczas fetch_lucky_number: {type(e).__name__}: {e}")
+        raise
     set_cached_number(r, number)
+    print(f"[GET /lucky-number/refresh] SUKCES - number={number}")
     return {"lucky_number": number, "source": "refresh"}
 
 
